@@ -129,7 +129,7 @@ def init_firestore():
 
 
 def main():
-    synced_at = datetime.datetime.utcnow().isoformat()
+    synced_at = datetime.datetime.now(datetime.UTC).isoformat()
 
     print("กำลังดึงสินค้าทั้งหมดจาก TRCloud ...")
     items = fetch_all_products()
@@ -138,10 +138,20 @@ def main():
     db = init_firestore()
     collection_ref = db.collection("inventory")
 
-    # เขียนแบบ batch (ครั้งละสูงสุด 500 รายการต่อ batch ตามข้อจำกัดของ Firestore)
-    batch = db.batch()
-    batch_count = 0
+    # ใช้ BulkWriter แทน batch() ธรรมดา เพราะ BulkWriter จัดการ retry,
+    # rate-limit และ error ชั่วคราว (เช่น DEADLINE_EXCEEDED) ให้อัตโนมัติ
+    # เหมาะกับการเขียนข้อมูลจำนวนมาก (หลักพันรายการ) แบบนี้
+    bulk_writer = db.bulk_writer()
     total_written = 0
+    failed_ids = []
+
+    def _on_batch_error(error, callback_attempts):
+        # เก็บ id ที่เขียนไม่สำเร็จไว้ log แต่ไม่ให้ script ล้มทั้งหมด
+        failed_ids.append(error.document_reference.id)
+        # คืนค่า True หมายถึง "ลองใหม่อีกครั้ง" (สูงสุดตามค่า default ของ BulkWriter)
+        return callback_attempts < 3
+
+    bulk_writer.on_write_error(_on_batch_error)
 
     for item in items:
         product_id = item.get("product_id")
@@ -150,17 +160,14 @@ def main():
 
         doc_data = transform(item, synced_at)
         doc_ref = collection_ref.document(product_id)
-        batch.set(doc_ref, doc_data, merge=True)
-        batch_count += 1
+        bulk_writer.set(doc_ref, doc_data, merge=True)
         total_written += 1
 
-        if batch_count >= 450:  # เผื่อ margin จากลิมิต 500
-            batch.commit()
-            batch = db.batch()
-            batch_count = 0
+    # รอให้ทุก write เสร็จ (รวมการ retry ที่ค้างอยู่) ก่อนไปขั้นตอนถัดไป
+    bulk_writer.close()
 
-    if batch_count > 0:
-        batch.commit()
+    if failed_ids:
+        print(f"คำเตือน: มี {len(failed_ids)} รายการที่เขียนไม่สำเร็จหลัง retry: {failed_ids}")
 
     # เก็บ log การ sync ล่าสุดไว้ดูย้อนหลังได้
     db.collection("sync_logs").document(synced_at).set({
