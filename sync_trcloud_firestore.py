@@ -6,12 +6,19 @@ TRCloud -> Firebase Firestore Sync (ฟรี 100%, ไม่ต้องผู�
 เหตุผล: ระบบมีสินค้าจำนวนมาก (หลักพันตัว) ถ้าเขียนทับทุกตัวทุกรอบ (ทุก 2 ชม. = 12
 รอบ/วัน) จะเกินโควตาฟรีของ Firestore (เขียนได้ 20,000 ครั้ง/วัน) ไปมาก
 
+เพิ่มความทนทาน (v2):
+- batch เล็กลง (100) + delay ระหว่าง batch นานขึ้น (3s) กันชน quota ของฐานข้อมูล
+  ที่เพิ่งสร้างใหม่ (ช่วงแรกมีเพดานความเร็วต่ำ ค่อยๆ ขยับขึ้นเองภายในไม่กี่วัน)
+- บันทึก state.json สะสมทีละ batch (ไม่รอจบทั้งหมด) กันข้อมูลหายถ้ารันไม่จบ
+- ถ้าบาง batch ล้มเหลวแม้ retry ครบแล้ว จะข้ามไปก่อน (ไม่ทำให้ทั้ง script ล้ม)
+  แล้วปล่อยให้รอบ sync ถัดไป (อีก 2 ชม.) ลองใหม่เฉพาะรายการที่ยังไม่สำเร็จ
+
 วิธีทำงาน:
 1) ดึงสินค้าทั้งหมดจาก TRCloud (search-inventory.php) แบบวนหน้าอัตโนมัติ
 2) เทียบกับ state.json (ไฟล์ที่เก็บ hash ของแต่ละสินค้าจากรอบ sync ก่อนหน้า
    ซึ่งถูก commit ไว้ใน git repo เอง)
 3) เขียนเข้า Firestore เฉพาะสินค้าที่ hash เปลี่ยนไปจากเดิม (ของใหม่/ค่าเปลี่ยน)
-4) อัปเดต state.json ใหม่ทั้งหมด ให้ GitHub Actions commit กลับเข้า repo ต่อ
+4) อัปเดต state.json ให้ GitHub Actions commit กลับเข้า repo ต่อ
 
 ต้องมี environment variables (ตั้งเป็น GitHub Secrets):
   - TRCLOUD_COMPANY_ID
@@ -156,18 +163,23 @@ def init_firestore():
     return firestore.client()
 
 
-def commit_batch_with_retry(batch, max_retries: int = 5):
-    delay = 2
+def commit_batch_with_retry(batch, max_retries: int = 5, base_delay: int = 3, max_delay: int = 60) -> bool:
+    """commit batch พร้อม retry แบบ exponential backoff (มี cap ไม่ให้รอนานเกินไป)
+    และเพิ่ม timeout ให้ยาวขึ้น (120s) เพราะฐานข้อมูลใหม่บางครั้งตอบช้ากว่าปกติ
+    คืนค่า True ถ้าสำเร็จ, False ถ้าล้มเหลวครบทุกครั้ง (ไม่ raise exception ทำให้ script ล้มทั้งหมด)"""
+    delay = base_delay
     for attempt in range(1, max_retries + 1):
         try:
-            batch.commit()
-            return
+            batch.commit(timeout=120)
+            return True
         except Exception as e:
+            print(f"  batch commit ล้มเหลว (ครั้งที่ {attempt}/{max_retries}): {e}")
             if attempt == max_retries:
-                raise
-            print(f"  batch commit ล้มเหลว (ครั้งที่ {attempt}): {e} -> รอ {delay}s แล้วลองใหม่")
+                return False
+            print(f"    รอ {delay}s แล้วลองใหม่ ...")
             time.sleep(delay)
-            delay *= 2
+            delay = min(delay * 2, max_delay)
+    return False
 
 
 def main():
@@ -180,9 +192,8 @@ def main():
     old_state = load_state()
     print(f"สถานะรอบก่อนหน้า: มีข้อมูล {len(old_state)} รายการใน state.json")
 
-    # หาว่ารายการไหนเปลี่ยนแปลงจริง (ต่างจาก hash เดิม หรือเป็นสินค้าใหม่)
-    changed_docs = []  # list of (product_id, doc_data)
-    new_state = {}
+    changed_docs = []       # list of (product_id, doc_data, content_hash)
+    unchanged_state = {}    # hash เดิมของรายการที่ไม่เปลี่ยน
 
     for item in items:
         product_id = item.get("product_id")
@@ -191,10 +202,11 @@ def main():
 
         doc_data = transform(item, synced_at)
         content_hash = compute_hash(doc_data)
-        new_state[product_id] = content_hash
 
         if old_state.get(product_id) != content_hash:
-            changed_docs.append((product_id, doc_data))
+            changed_docs.append((product_id, doc_data, content_hash))
+        else:
+            unchanged_state[product_id] = content_hash
 
     print(f"พบรายการที่เปลี่ยนแปลง/ใหม่: {len(changed_docs)} จากทั้งหมด {len(items)} รายการ")
 
@@ -205,49 +217,68 @@ def main():
             f"กรุณาตรวจสอบว่าข้อมูลเปลี่ยนแปลงเยอะผิดปกติหรือไม่"
         )
 
+    # state ที่จะบันทึกจริง = รายการที่ไม่เปลี่ยน + จะเติมรายการที่เขียนสำเร็จเพิ่มทีละ chunk
+    confirmed_state = dict(unchanged_state)
+    save_state(confirmed_state)
+
+    success_count = 0
+    failed_count = 0
+
     if changed_docs:
         db = init_firestore()
         collection_ref = db.collection("inventory")
 
-        BATCH_SIZE = 300
-        BATCH_DELAY_SECONDS = 1.5
+        BATCH_SIZE = 100
+        BATCH_DELAY_SECONDS = 3
 
-        batch = db.batch()
-        batch_count = 0
-        total_written = 0
+        def flush_chunk(chunk_items):
+            nonlocal success_count, failed_count
+            if not chunk_items:
+                return
+            batch = db.batch()
+            for product_id, doc_data, _ in chunk_items:
+                doc_ref = collection_ref.document(product_id)
+                batch.set(doc_ref, doc_data, merge=True)
 
-        for product_id, doc_data in changed_docs:
-            doc_ref = collection_ref.document(product_id)
-            batch.set(doc_ref, doc_data, merge=True)
-            batch_count += 1
-            total_written += 1
+            ok = commit_batch_with_retry(batch)
+            if ok:
+                for product_id, _, content_hash in chunk_items:
+                    confirmed_state[product_id] = content_hash
+                success_count += len(chunk_items)
+                print(f"  บันทึกสำเร็จ {success_count} / {len(changed_docs)} รายการที่เปลี่ยนแปลง")
+            else:
+                failed_count += len(chunk_items)
+                print(f"  !! ข้าม chunk นี้ไป ({len(chunk_items)} รายการ) จะลองใหม่รอบ sync ถัดไปแทน")
 
-            if batch_count >= BATCH_SIZE:
-                commit_batch_with_retry(batch)
-                print(f"  บันทึกแล้ว {total_written} / {len(changed_docs)} รายการที่เปลี่ยนแปลง")
-                batch = db.batch()
-                batch_count = 0
-                time.sleep(BATCH_DELAY_SECONDS)
+            save_state(confirmed_state)
+            time.sleep(BATCH_DELAY_SECONDS)
 
-        if batch_count > 0:
-            commit_batch_with_retry(batch)
+        chunk = []
+        for entry in changed_docs:
+            chunk.append(entry)
+            if len(chunk) >= BATCH_SIZE:
+                flush_chunk(chunk)
+                chunk = []
+        flush_chunk(chunk)
 
-        print(f"บันทึกเข้า Firestore สำเร็จ: {total_written} รายการ เมื่อ {synced_at}")
+        print(f"\nสรุป: สำเร็จ {success_count} รายการ, ล้มเหลว {failed_count} รายการ (จะลองใหม่รอบถัดไป)")
 
         try:
             db.collection("sync_logs").document(synced_at).set({
                 "synced_at": synced_at,
                 "total_items_checked": len(items),
-                "total_items_written": total_written,
+                "total_items_written": success_count,
+                "total_items_failed": failed_count,
             })
         except Exception as e:
             print(f"หมายเหตุ: บันทึก sync_logs ไม่สำเร็จ (ไม่กระทบข้อมูลหลักที่บันทึกไปแล้ว): {e}")
     else:
         print("ไม่มีรายการเปลี่ยนแปลง -> ข้ามการเขียน Firestore รอบนี้ (ประหยัด quota)")
 
-    # อัปเดต state.json เสมอ (ให้ workflow commit กลับเข้า repo ต่อ)
-    save_state(new_state)
-    print(f"อัปเดต {STATE_FILE} เรียบร้อย ({len(new_state)} รายการ)")
+    print(f"อัปเดต {STATE_FILE} เรียบร้อย ({len(confirmed_state)} รายการที่ยืนยันสำเร็จสะสม)")
+
+    if changed_docs and success_count == 0:
+        raise RuntimeError("เขียนเข้า Firestore ไม่สำเร็จเลยสักรายการในรอบนี้")
 
 
 if __name__ == "__main__":
