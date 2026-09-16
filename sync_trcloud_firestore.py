@@ -2,12 +2,16 @@
 TRCloud -> Firebase Firestore Sync (ฟรี 100%, ไม่ต้องผูกบัตร/ยืนยันเอกสาร)
 ==========================================================================
 
-สคริปต์นี้:
-1) ดึงสินค้าทั้งหมดจาก TRCloud (search-inventory.php) แบบวนหน้าอัตโนมัติ
-2) บันทึก/อัปเดตแต่ละสินค้าเข้า Firebase Firestore (collection "inventory")
-   โดยใช้ product_id เป็น document id (ทำให้ sync ซ้ำแล้วอัปเดตทับของเดิม ไม่ซ้ำ)
+เวอร์ชันนี้ sync แบบ "เขียนเฉพาะรายการที่เปลี่ยนแปลง" (diff-based)
+เหตุผล: ระบบมีสินค้าจำนวนมาก (หลักพันตัว) ถ้าเขียนทับทุกตัวทุกรอบ (ทุก 2 ชม. = 12
+รอบ/วัน) จะเกินโควตาฟรีของ Firestore (เขียนได้ 20,000 ครั้ง/วัน) ไปมาก
 
-ถูกเรียกโดย GitHub Actions ทุก 2 ชั่วโมง (ดู .github/workflows/sync.yml)
+วิธีทำงาน:
+1) ดึงสินค้าทั้งหมดจาก TRCloud (search-inventory.php) แบบวนหน้าอัตโนมัติ
+2) เทียบกับ state.json (ไฟล์ที่เก็บ hash ของแต่ละสินค้าจากรอบ sync ก่อนหน้า
+   ซึ่งถูก commit ไว้ใน git repo เอง)
+3) เขียนเข้า Firestore เฉพาะสินค้าที่ hash เปลี่ยนไปจากเดิม (ของใหม่/ค่าเปลี่ยน)
+4) อัปเดต state.json ใหม่ทั้งหมด ให้ GitHub Actions commit กลับเข้า repo ต่อ
 
 ต้องมี environment variables (ตั้งเป็น GitHub Secrets):
   - TRCLOUD_COMPANY_ID
@@ -29,7 +33,7 @@ from firebase_admin import credentials, firestore
 
 
 # ----------------------------------------------------------------------
-# TRCloud config (อ่านจาก environment variables / GitHub Secrets)
+# TRCloud config
 # ----------------------------------------------------------------------
 TRCLOUD_ENDPOINT = "https://thaidrill.trcloud.co/application/api-connector/end-point/engine-inventory/search-inventory.php"
 COMPANY_ID = os.environ["TRCLOUD_COMPANY_ID"]
@@ -38,6 +42,11 @@ ENCRYPT_HEAD = os.environ["TRCLOUD_ENCRYPT_HEAD"]
 ORIGIN = os.environ["TRCLOUD_ORIGIN"]
 
 PAGE_SIZE = 51
+STATE_FILE = "state.json"
+
+# กันเหนียว: ถ้ารอบไหนต้องเขียนเกินจำนวนนี้ (ผิดปกติมาก) ให้หยุดแทนที่จะยิงจนชน
+# โควตาเต็มวันโดยไม่รู้ตัว (ปกติควรเขียนแค่หลักสิบ-หลักร้อยต่อรอบ ไม่ใช่หลักพัน)
+MAX_WRITES_PER_RUN = 15000
 
 
 def build_secure_key(encrypt_head: str, timestamp: str) -> str:
@@ -115,43 +124,65 @@ def transform(item: dict, synced_at: str) -> dict:
         "reorder_point": to_float(item.get("reorder_point")),
         "maximum_stock": to_float(item.get("maximum_stock")),
         "update_dt": item.get("update_dt"),
-        "raw_json": json.dumps(item, ensure_ascii=False),  # เก็บข้อมูลดิบทั้งหมดไว้เผื่อใช้ภายหลัง
+        "raw_json": json.dumps(item, ensure_ascii=False),
         "synced_at": synced_at,
     }
 
 
+def compute_hash(doc_data: dict) -> str:
+    """hash เนื้อหาของสินค้า (ไม่รวม synced_at ที่เปลี่ยนทุกรอบอยู่แล้ว)
+    เพื่อใช้เทียบว่าเปลี่ยนแปลงจริงหรือไม่"""
+    comparable = {k: v for k, v in doc_data.items() if k != "synced_at"}
+    raw = json.dumps(comparable, sort_keys=True, ensure_ascii=False)
+    return hashlib.md5(raw.encode("utf-8")).hexdigest()
+
+
+def load_state() -> dict:
+    if os.path.exists(STATE_FILE):
+        with open(STATE_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    return {}
+
+
+def save_state(state: dict):
+    with open(STATE_FILE, "w", encoding="utf-8") as f:
+        json.dump(state, f, ensure_ascii=False, indent=2)
+
+
 def init_firestore():
-    """เริ่มการเชื่อมต่อ Firebase โดยอ่าน service account จาก environment variable"""
     service_account_info = json.loads(os.environ["FIREBASE_SERVICE_ACCOUNT_JSON"])
     cred = credentials.Certificate(service_account_info)
     firebase_admin.initialize_app(cred)
     return firestore.client()
 
 
+def commit_batch_with_retry(batch, max_retries: int = 5):
+    delay = 2
+    for attempt in range(1, max_retries + 1):
+        try:
+            batch.commit()
+            return
+        except Exception as e:
+            if attempt == max_retries:
+                raise
+            print(f"  batch commit ล้มเหลว (ครั้งที่ {attempt}): {e} -> รอ {delay}s แล้วลองใหม่")
+            time.sleep(delay)
+            delay *= 2
+
+
 def main():
-    synced_at = datetime.datetime.now(datetime.UTC).isoformat()
+    synced_at = datetime.datetime.utcnow().isoformat()
 
     print("กำลังดึงสินค้าทั้งหมดจาก TRCloud ...")
     items = fetch_all_products()
     print(f"ดึงมาได้ {len(items)} รายการ")
 
-    db = init_firestore()
-    collection_ref = db.collection("inventory")
+    old_state = load_state()
+    print(f"สถานะรอบก่อนหน้า: มีข้อมูล {len(old_state)} รายการใน state.json")
 
-    # ใช้ BulkWriter แทน batch() ธรรมดา เพราะ BulkWriter จัดการ retry,
-    # rate-limit และ error ชั่วคราว (เช่น DEADLINE_EXCEEDED) ให้อัตโนมัติ
-    # เหมาะกับการเขียนข้อมูลจำนวนมาก (หลักพันรายการ) แบบนี้
-    bulk_writer = db.bulk_writer()
-    total_written = 0
-    failed_ids = []
-
-    def _on_batch_error(error, callback_attempts):
-        # เก็บ id ที่เขียนไม่สำเร็จไว้ log แต่ไม่ให้ script ล้มทั้งหมด
-        failed_ids.append(error.document_reference.id)
-        # คืนค่า True หมายถึง "ลองใหม่อีกครั้ง" (สูงสุดตามค่า default ของ BulkWriter)
-        return callback_attempts < 3
-
-    bulk_writer.on_write_error(_on_batch_error)
+    # หาว่ารายการไหนเปลี่ยนแปลงจริง (ต่างจาก hash เดิม หรือเป็นสินค้าใหม่)
+    changed_docs = []  # list of (product_id, doc_data)
+    new_state = {}
 
     for item in items:
         product_id = item.get("product_id")
@@ -159,23 +190,64 @@ def main():
             continue
 
         doc_data = transform(item, synced_at)
-        doc_ref = collection_ref.document(product_id)
-        bulk_writer.set(doc_ref, doc_data, merge=True)
-        total_written += 1
+        content_hash = compute_hash(doc_data)
+        new_state[product_id] = content_hash
 
-    # รอให้ทุก write เสร็จ (รวมการ retry ที่ค้างอยู่) ก่อนไปขั้นตอนถัดไป
-    bulk_writer.close()
+        if old_state.get(product_id) != content_hash:
+            changed_docs.append((product_id, doc_data))
 
-    if failed_ids:
-        print(f"คำเตือน: มี {len(failed_ids)} รายการที่เขียนไม่สำเร็จหลัง retry: {failed_ids}")
+    print(f"พบรายการที่เปลี่ยนแปลง/ใหม่: {len(changed_docs)} จากทั้งหมด {len(items)} รายการ")
 
-    # เก็บ log การ sync ล่าสุดไว้ดูย้อนหลังได้
-    db.collection("sync_logs").document(synced_at).set({
-        "synced_at": synced_at,
-        "total_items": total_written,
-    })
+    if len(changed_docs) > MAX_WRITES_PER_RUN:
+        raise RuntimeError(
+            f"จำนวนรายการที่ต้องเขียน ({len(changed_docs)}) เกิน MAX_WRITES_PER_RUN "
+            f"({MAX_WRITES_PER_RUN}) -> หยุดไว้ก่อนกันชน quota เต็มวันโดยไม่ตั้งใจ "
+            f"กรุณาตรวจสอบว่าข้อมูลเปลี่ยนแปลงเยอะผิดปกติหรือไม่"
+        )
 
-    print(f"บันทึกเข้า Firestore สำเร็จ: {total_written} รายการ เมื่อ {synced_at}")
+    if changed_docs:
+        db = init_firestore()
+        collection_ref = db.collection("inventory")
+
+        BATCH_SIZE = 300
+        BATCH_DELAY_SECONDS = 1.5
+
+        batch = db.batch()
+        batch_count = 0
+        total_written = 0
+
+        for product_id, doc_data in changed_docs:
+            doc_ref = collection_ref.document(product_id)
+            batch.set(doc_ref, doc_data, merge=True)
+            batch_count += 1
+            total_written += 1
+
+            if batch_count >= BATCH_SIZE:
+                commit_batch_with_retry(batch)
+                print(f"  บันทึกแล้ว {total_written} / {len(changed_docs)} รายการที่เปลี่ยนแปลง")
+                batch = db.batch()
+                batch_count = 0
+                time.sleep(BATCH_DELAY_SECONDS)
+
+        if batch_count > 0:
+            commit_batch_with_retry(batch)
+
+        print(f"บันทึกเข้า Firestore สำเร็จ: {total_written} รายการ เมื่อ {synced_at}")
+
+        try:
+            db.collection("sync_logs").document(synced_at).set({
+                "synced_at": synced_at,
+                "total_items_checked": len(items),
+                "total_items_written": total_written,
+            })
+        except Exception as e:
+            print(f"หมายเหตุ: บันทึก sync_logs ไม่สำเร็จ (ไม่กระทบข้อมูลหลักที่บันทึกไปแล้ว): {e}")
+    else:
+        print("ไม่มีรายการเปลี่ยนแปลง -> ข้ามการเขียน Firestore รอบนี้ (ประหยัด quota)")
+
+    # อัปเดต state.json เสมอ (ให้ workflow commit กลับเข้า repo ต่อ)
+    save_state(new_state)
+    print(f"อัปเดต {STATE_FILE} เรียบร้อย ({len(new_state)} รายการ)")
 
 
 if __name__ == "__main__":
